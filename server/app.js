@@ -22,6 +22,16 @@ if (!fs.existsSync(DATA_FILE)) {
   fs.writeFileSync(DATA_FILE, JSON.stringify([]));
 }
 
+// 缓存变量
+let lastScanTime = 0;
+const SCAN_INTERVAL = 3600000; // 1小时，单位毫秒
+
+// 搜索结果缓存
+const searchCache = new Map();
+const SEARCH_CACHE_TTL = 300000; // 5分钟，单位毫秒
+
+// 缓存项结构：{ results: [], timestamp: number }
+
 // 获取视频数据
 function getVideoData() {
   const data = fs.readFileSync(DATA_FILE, 'utf8');
@@ -62,8 +72,47 @@ function saveTagsToFile(folderPath, tags) {
   }
 }
 
-// 扫描目录获取视频和封面
-function scanVideos() {
+// 扫描单个视频文件夹
+function scanSingleVideo(folderName) {
+  const folderPath = path.join(VIDEO_ROOT_DIR, folderName);
+  const files = fs.readdirSync(folderPath);
+  
+  // 查找第一个视频文件
+  const videoFile = files.find(file => 
+    ['.mp4', '.avi', '.mkv', '.mov'].includes(path.extname(file).toLowerCase())
+  );
+  
+  if (!videoFile) return null;
+  
+  // 查找第一个图片文件作为封面
+  const coverFile = files.find(file => 
+    ['.jpg', '.jpeg', '.png', '.gif'].includes(path.extname(file).toLowerCase())
+  );
+  
+  // 读取标签文件
+  const tags = readTagsFromFile(folderPath);
+  
+  return {
+    id: folderName,
+    name: folderName,
+    videoUrl: `http://localhost:${PORT}/videos/${folderName}/${videoFile}`,
+    coverUrl: coverFile ? `http://localhost:${PORT}/videos/${folderName}/${coverFile}` : null,
+    tags: tags,
+    createdAt: new Date().toISOString()
+  };
+}
+
+// 扫描目录获取视频和封面 - 优化版
+function scanVideos(forceRescan = false) {
+  // 检查是否需要重新扫描
+  const now = Date.now();
+  if (!forceRescan && now - lastScanTime < SCAN_INTERVAL) {
+    // 返回缓存数据
+    return getVideoData();
+  }
+  
+  console.log('Scanning videos...');
+  const startTime = Date.now();
   const videos = [];
   
   // 读取所有子文件夹
@@ -72,38 +121,30 @@ function scanVideos() {
     .map(dirent => dirent.name);
   
   videoFolders.forEach(folderName => {
-    const folderPath = path.join(VIDEO_ROOT_DIR, folderName);
-    const files = fs.readdirSync(folderPath);
-    
-    // 查找第一个视频文件
-    const videoFile = files.find(file => 
-      ['.mp4', '.avi', '.mkv', '.mov'].includes(path.extname(file).toLowerCase())
-    );
-    
-    // 查找第一个图片文件作为封面
-    const coverFile = files.find(file => 
-      ['.jpg', '.jpeg', '.png', '.gif'].includes(path.extname(file).toLowerCase())
-    );
-    
-    // 读取标签文件
-    const tags = readTagsFromFile(folderPath);
-    
-    if (videoFile) {
-      videos.push({
-        id: folderName,
-        name: folderName,
-        videoUrl: `http://localhost:${PORT}/videos/${folderName}/${videoFile}`,
-        coverUrl: coverFile ? `http://localhost:${PORT}/videos/${folderName}/${coverFile}` : null,
-        tags: tags,
-        createdAt: new Date().toISOString()
-      });
+    const video = scanSingleVideo(folderName);
+    if (video) {
+      videos.push(video);
     }
   });
   
   // 保存到JSON文件，用于快速查询
   saveVideoData(videos);
+  lastScanTime = now;
+  
+  const endTime = Date.now();
+  console.log(`Video scan completed in ${endTime - startTime}ms. Found ${videos.length} videos.`);
+  
   return videos;
 }
+
+// 手动触发重新扫描
+app.get('/api/videos/rescan', (req, res) => {
+  const videos = scanVideos(true);
+  res.json({
+    message: 'Rescan completed',
+    videoCount: videos.length
+  });
+});
 
 // 静态文件服务 - 直接映射到视频根目录
 app.use('/videos', express.static(VIDEO_ROOT_DIR));
@@ -112,26 +153,91 @@ app.use('/videos', express.static(VIDEO_ROOT_DIR));
 
 // 获取视频列表
 app.get('/api/videos', (req, res) => {
-  const videos = scanVideos();
-  res.json(videos);
+  const { page = 1, limit = 20 } = req.query;
+  const pageNum = parseInt(page);
+  const limitNum = parseInt(limit);
+  
+  // 只在第一次请求或有更新时扫描视频
+  let videos = getVideoData();
+  if (videos.length === 0) {
+    videos = scanVideos();
+  }
+  
+  // 分页处理
+  const startIndex = (pageNum - 1) * limitNum;
+  const endIndex = startIndex + limitNum;
+  const paginatedVideos = videos.slice(startIndex, endIndex);
+  
+  res.json({
+    videos: paginatedVideos,
+    pagination: {
+      currentPage: pageNum,
+      pageSize: limitNum,
+      totalCount: videos.length,
+      totalPages: Math.ceil(videos.length / limitNum)
+    }
+  });
 });
 
 // 搜索视频
 app.get('/api/videos/search', (req, res) => {
-  const { q } = req.query;
-  const videos = getVideoData();
+  const { q, page = 1, limit = 20 } = req.query;
+  const pageNum = parseInt(page);
+  const limitNum = parseInt(limit);
   
-  if (!q) {
-    return res.json(videos);
+  let videos = getVideoData();
+  if (videos.length === 0) {
+    videos = scanVideos();
   }
   
-  const searchTerm = q.toLowerCase();
-  const results = videos.filter(video => 
-    video.name.toLowerCase().includes(searchTerm) ||
-    (video.tags && video.tags.some(tag => tag.toLowerCase().includes(searchTerm)))
-  );
+  let results = videos;
+  if (q) {
+    // 生成缓存键
+    const cacheKey = q.toLowerCase();
+    const now = Date.now();
+    
+    // 检查缓存
+    if (searchCache.has(cacheKey)) {
+      const cached = searchCache.get(cacheKey);
+      if (now - cached.timestamp < SEARCH_CACHE_TTL) {
+        // 使用缓存结果
+        results = cached.results;
+      } else {
+        // 缓存过期，移除
+        searchCache.delete(cacheKey);
+      }
+    }
+    
+    // 如果没有缓存或缓存过期，执行搜索
+    if (!searchCache.has(cacheKey)) {
+      const searchTerm = q.toLowerCase();
+      results = videos.filter(video => 
+        video.name.toLowerCase().includes(searchTerm) ||
+        (video.tags && video.tags.some(tag => tag.toLowerCase().includes(searchTerm)))
+      );
+      
+      // 存入缓存
+      searchCache.set(cacheKey, {
+        results: results,
+        timestamp: now
+      });
+    }
+  }
   
-  res.json(results);
+  // 分页处理
+  const startIndex = (pageNum - 1) * limitNum;
+  const endIndex = startIndex + limitNum;
+  const paginatedResults = results.slice(startIndex, endIndex);
+  
+  res.json({
+    videos: paginatedResults,
+    pagination: {
+      currentPage: pageNum,
+      pageSize: limitNum,
+      totalCount: results.length,
+      totalPages: Math.ceil(results.length / limitNum)
+    }
+  });
 });
 
 // 获取单个视频信息
@@ -170,11 +276,18 @@ app.post('/api/videos/:id/tags', (req, res) => {
     saveTagsToFile(folderPath, tags);
   }
   
-  // 重新扫描视频，更新JSON文件
-  const videos = scanVideos();
-  const updatedVideo = videos.find(v => v.id === id);
+  // 更新JSON文件，不需要重新扫描所有视频
+  let videos = getVideoData();
+  const videoIndex = videos.findIndex(v => v.id === id);
+  if (videoIndex !== -1) {
+    videos[videoIndex].tags = tags;
+    saveVideoData(videos);
+  }
   
-  res.json(updatedVideo);
+  // 清除相关搜索缓存
+  searchCache.clear();
+  
+  res.json(videos[videoIndex]);
 });
 
 // 删除标签
@@ -198,11 +311,18 @@ app.delete('/api/videos/:id/tags/:tag', (req, res) => {
     saveTagsToFile(folderPath, tags);
   }
   
-  // 重新扫描视频，更新JSON文件
-  const videos = scanVideos();
-  const updatedVideo = videos.find(v => v.id === id);
+  // 更新JSON文件，不需要重新扫描所有视频
+  let videos = getVideoData();
+  const videoIndex = videos.findIndex(v => v.id === id);
+  if (videoIndex !== -1) {
+    videos[videoIndex].tags = tags;
+    saveVideoData(videos);
+  }
   
-  res.json(updatedVideo);
+  // 清除相关搜索缓存
+  searchCache.clear();
+  
+  res.json(videos[videoIndex]);
 });
 
 // 启动服务器
